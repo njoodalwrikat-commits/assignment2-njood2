@@ -26,3 +26,20 @@ npm run test:coverage
 - `deploy/nginx.conf` — the nginx reverse-proxy site config.
 - `deploy/quotes-api.service` — the systemd unit that runs the app.
 - Server provisioning and the CI/CD you must build are described in the assignment and setup guide your instructor provides.
+
+## CI/CD Verification
+
+### Rollback
+
+Each deployment is copied into a new release directory under `/opt/quotes-api/releases/`.
+
+The `current` symlink is switched to the new release. If the health check fails, the CD workflow repoints `current` to the previous release and restarts the application.
+
+### Health Check
+
+After deployment, the CD workflow checks `http://SERVER_HOST/health` through nginx on port 80 with retries.
+
+The deployment was verified with:
+
+```bash
+curl http://16.171.38.3/health
