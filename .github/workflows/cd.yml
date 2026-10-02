@@ -86,6 +86,12 @@ jobs:
             sudo nginx -s reload
           EOF
 
+      - name: Simulate deployment failure
+        if: startsWith(inputs.version, 'rollback-test')
+        run: |
+          echo "Simulating deployment failure for rollback test."
+          exit 1
+          
       - name: Health check
         id: health
         env:
