@@ -1,0 +1,138 @@
+name: CD
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install production dependencies
+        run: npm ci --omit=dev
+
+      - name: Prepare SSH
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SERVER_HOST: ${{ vars.SERVER_HOST }}
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H "$SERVER_HOST" >> ~/.ssh/known_hosts
+
+      - name: Prepare release
+        env:
+          VERSION: ${{ inputs.version }}
+          SERVER_HOST: ${{ vars.SERVER_HOST }}
+          SERVER_USER: ${{ vars.SERVER_USER }}
+        run: |
+          ssh "$SERVER_USER@$SERVER_HOST" \
+            "mkdir -p /opt/quotes-api/releases/$VERSION"
+
+      - name: Deploy release
+        env:
+          VERSION: ${{ inputs.version }}
+          SERVER_HOST: ${{ vars.SERVER_HOST }}
+          SERVER_USER: ${{ vars.SERVER_USER }}
+        run: |
+          rsync -az --delete \
+            --exclude='.git/' \
+            ./ "$SERVER_USER@$SERVER_HOST:/opt/quotes-api/releases/$VERSION/"
+
+      - name: Switch release and restart
+        id: deploy
+        env:
+          VERSION: ${{ inputs.version }}
+          SERVER_HOST: ${{ vars.SERVER_HOST }}
+          SERVER_USER: ${{ vars.SERVER_USER }}
+        run: |
+          ssh "$SERVER_USER@$SERVER_HOST" <<EOF
+            set -e
+
+            CURRENT="/opt/quotes-api/current"
+            RELEASE="/opt/quotes-api/releases/$VERSION"
+
+            if [ -L "\$CURRENT" ]; then
+              readlink -f "\$CURRENT" > /tmp/quotes-api-previous-release
+            else
+              : > /tmp/quotes-api-previous-release
+            fi
+
+            ln -sfn "\$RELEASE" "\$CURRENT"
+
+            sudo systemctl restart quotes-api
+            sudo nginx -s reload
+          EOF
+
+      - name: Health check
+        id: health
+        env:
+          SERVER_HOST: ${{ vars.SERVER_HOST }}
+        run: |
+          for i in {1..12}; do
+            if curl --fail --silent --show-error \
+              --max-time 5 \
+              "http://$SERVER_HOST/health"; then
+              echo
+              echo "Health check passed."
+              exit 0
+            fi
+
+            echo "Health check attempt $i failed; retrying..."
+            sleep 5
+          done
+
+          echo "Health check failed."
+          exit 1
+
+      - name: Roll back on failure
+        if: failure()
+        env:
+          SERVER_HOST: ${{ vars.SERVER_HOST }}
+          SERVER_USER: ${{ vars.SERVER_USER }}
+        run: |
+          ssh "$SERVER_USER@$SERVER_HOST" <<'EOF'
+            set -e
+
+            CURRENT="/opt/quotes-api/current"
+
+            if [ -s /tmp/quotes-api-previous-release ]; then
+              PREVIOUS="$(cat /tmp/quotes-api-previous-release)"
+              ln -sfn "$PREVIOUS" "$CURRENT"
+              sudo systemctl restart quotes-api
+              sudo nginx -s reload
+              echo "Rolled back to $PREVIOUS"
+            else
+              echo "No previous release available for rollback."
+            fi
+          EOF
+
+      - name: Create release tag
+        if: success()
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          git tag "$VERSION"
+          git push origin "$VERSION"
